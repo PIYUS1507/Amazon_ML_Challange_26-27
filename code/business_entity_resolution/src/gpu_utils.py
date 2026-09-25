@@ -80,8 +80,8 @@ def xgboost_device():
 def gpu_summary() -> str:
     """Return a human-readable summary of GPU capabilities."""
     lines = [
-        f"PyTorch CUDA:  {'✓' if HAS_TORCH_CUDA else '✗'}  (device={TORCH_DEVICE})",
-        f"XGBoost CUDA:  {'✓' if HAS_XGBOOST_CUDA else '✗'}  (device={xgboost_device()})",
+        f"PyTorch CUDA:  {'YES' if HAS_TORCH_CUDA else 'NO'}  (device={TORCH_DEVICE})",
+        f"XGBoost CUDA:  {'YES' if HAS_XGBOOST_CUDA else 'NO'}  (device={xgboost_device()})",
     ]
     return "\n".join(lines)
 

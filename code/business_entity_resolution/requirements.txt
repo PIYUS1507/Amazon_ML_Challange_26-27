@@ -10,5 +10,13 @@ numpy>=1.24.0
 # String matching (fast)
 rapidfuzz>=3.0.0
 
-# Optional: GPU acceleration for XGBoost
-# xgboost[gpu]>=1.7.0
+# ── GPU acceleration (optional but recommended) ─────────────────────────────
+
+# XGBoost GPU is auto-detected at runtime — no extra install needed if you
+# already have xgboost>=2.0 and a CUDA-capable GPU.
+
+# PyTorch CUDA — enables GPU-accelerated TF-IDF blocking and feature computation.
+# Install the CUDA version matching your driver (see https://pytorch.org/get-started):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu126
+# The pipeline works without it (falls back to CPU), but GPU blocking adds
+# recall and runs significantly faster at scale.
