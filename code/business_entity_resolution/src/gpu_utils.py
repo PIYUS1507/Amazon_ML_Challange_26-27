@@ -30,7 +30,7 @@ try:
         HAS_TORCH_CUDA = True
         TORCH_DEVICE = "cuda"
         _gpu_name = _torch.cuda.get_device_name(0)
-        _gpu_mem = _torch.cuda.get_device_properties(0).total_mem / (1024 ** 3)
+        _gpu_mem = _torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
         logger.info(f"GPU detected: {_gpu_name} ({_gpu_mem:.1f} GB) — PyTorch CUDA enabled")
     else:
         logger.info("PyTorch installed but CUDA not available — using CPU")
