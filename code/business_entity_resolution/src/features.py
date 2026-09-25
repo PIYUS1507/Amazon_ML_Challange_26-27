@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Step 3: Feature Engineering for Pairwise Matching (Optimized & Accelerated)
+Step 3: Feature Engineering for Pairwise Matching (Optimized & Multi-Threaded)
 
 Computes 20 pairwise similarity features between candidate pairs using:
+  - Multi-threaded shared-memory parallelism (OpenMP-style multi-core execution)
   - rapidfuzz AVX2 C++ engine for Levenshtein, token sort, token set, and LCS
   - Instant hash dict lookups (bypassing slow pandas .at[] index lookups)
   - Real-time progress reporting with throughput (pairs/sec) and ETA
@@ -16,16 +17,21 @@ Features:
                Jaccard bigrams, numeric overlap, prefix-5, LCS ratio
   Meta (3): country match, cross name1∩addr2 tokens, cross name2∩addr1 tokens
 """
+import os
 import re
 import gc
 import time
 import logging
+import concurrent.futures
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# Number of worker threads for parallel feature extraction
+N_WORKERS = min(os.cpu_count() or 4, 16)
 
 # ── High-speed string similarity backend ──────────────────────────────────────
 try:
@@ -158,17 +164,57 @@ FEATURE_NAMES = [
 ]
 
 
+# ── Worker function for sub-batch parallelization ─────────────────────────────
+
+def _compute_features_sub_batch(
+    sub_n1: list, sub_n2: list,
+    sub_a1: list, sub_a2: list,
+    sub_c1: list, sub_c2: list,
+) -> np.ndarray:
+    """Compute all 20 features for a slice of pairs in parallel."""
+    m = len(sub_n1)
+    sub_X = np.zeros((m, len(FEATURE_NAMES)), dtype=np.float32)
+
+    # Name features (0-9)
+    sub_X[:, 0] = _lev_ratio_batch(sub_n1, sub_n2)
+    sub_X[:, 1] = _tok_sort_batch(sub_n1, sub_n2)
+    sub_X[:, 2] = _tok_set_batch(sub_n1, sub_n2)
+    sub_X[:, 3] = _jaccard_tokens_batch(sub_n1, sub_n2)
+    sub_X[:, 4] = _jaccard_bigrams_batch(sub_n1, sub_n2)
+    sub_X[:, 5] = _prefix_match_batch(sub_n1, sub_n2, 3)
+    sub_X[:, 6] = _prefix_match_batch(sub_n1, sub_n2, 5)
+    sub_X[:, 7] = _lcs_ratio_batch(sub_n1, sub_n2)
+    sub_X[:, 8] = _length_ratio_batch(sub_n1, sub_n2)
+    sub_X[:, 9] = np.array([1.0 if a == b else 0.0 for a, b in zip(sub_n1, sub_n2)], dtype=np.float32)
+
+    # Address features (10-16)
+    sub_X[:, 10] = _lev_ratio_batch(sub_a1, sub_a2)
+    sub_X[:, 11] = _tok_sort_batch(sub_a1, sub_a2)
+    sub_X[:, 12] = _jaccard_tokens_batch(sub_a1, sub_a2)
+    sub_X[:, 13] = _jaccard_bigrams_batch(sub_a1, sub_a2)
+    sub_X[:, 14] = _numeric_overlap_batch(sub_a1, sub_a2)
+    sub_X[:, 15] = _prefix_match_batch(sub_a1, sub_a2, 5)
+    sub_X[:, 16] = _lcs_ratio_batch(sub_a1, sub_a2)
+
+    # Meta features (17-19)
+    sub_X[:, 17] = np.array([1.0 if a == b else 0.0 for a, b in zip(sub_c1, sub_c2)], dtype=np.float32)
+    sub_X[:, 18] = _cross_tok_batch(sub_n1, sub_a2)
+    sub_X[:, 19] = _cross_tok_batch(sub_n2, sub_a1)
+
+    return sub_X
+
+
 # ── Main feature computation ──────────────────────────────────────────────────
 
 def build_feature_matrix(
     s1_df: pd.DataFrame,
     s23_df: pd.DataFrame,
     candidate_pairs: Dict[str, set],
-    batch_size: int = 50_000,
+    batch_size: int = 100_000,
 ) -> Tuple[np.ndarray, List[Tuple[str, str]]]:
     """
-    Build feature matrix for all candidate pairs in vectorized batches.
-    Uses ultra-fast dict lookups and rapidfuzz C++ routines.
+    Build feature matrix for all candidate pairs in vectorized multi-threaded batches.
+    Utilizes multi-core OpenMP-style parallel processing across all CPU threads.
     """
     logger.info("Preparing fast entity lookup dictionaries...")
     t_prep = time.time()
@@ -194,7 +240,7 @@ def build_feature_matrix(
                 pair_ids.append((s1_id, cand_id))
 
     n = len(pair_ids)
-    logger.info(f"Total candidate pairs to featurize: {n:,}")
+    logger.info(f"Total candidate pairs to featurize: {n:,} (using {N_WORKERS} parallel threads)")
 
     if n == 0:
         return np.zeros((0, len(FEATURE_NAMES)), dtype=np.float32), []
@@ -202,54 +248,47 @@ def build_feature_matrix(
     X = np.zeros((n, len(FEATURE_NAMES)), dtype=np.float32)
     t_start = time.time()
 
-    # Process in batches
-    for batch_start in range(0, n, batch_size):
-        batch_end = min(batch_start + batch_size, n)
-        batch = pair_ids[batch_start:batch_end]
+    # Worker chunk size within each batch
+    sub_chunk_size = max(10_000, batch_size // N_WORKERS)
 
-        n1 = [s1_names.get(s1, "") for s1, _ in batch]
-        n2 = [s23_names.get(s23, "") for _, s23 in batch]
-        a1 = [s1_addrs.get(s1, "") for s1, _ in batch]
-        a2 = [s23_addrs.get(s23, "") for _, s23 in batch]
-        c1 = [s1_countries.get(s1, "") for s1, _ in batch]
-        c2 = [s23_countries.get(s23, "") for _, s23 in batch]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=N_WORKERS) as executor:
+        for batch_start in range(0, n, batch_size):
+            batch_end = min(batch_start + batch_size, n)
+            batch = pair_ids[batch_start:batch_end]
 
-        sl = slice(batch_start, batch_end)
+            n1 = [s1_names.get(s1, "") for s1, _ in batch]
+            n2 = [s23_names.get(s23, "") for _, s23 in batch]
+            a1 = [s1_addrs.get(s1, "") for s1, _ in batch]
+            a2 = [s23_addrs.get(s23, "") for _, s23 in batch]
+            c1 = [s1_countries.get(s1, "") for s1, _ in batch]
+            c2 = [s23_countries.get(s23, "") for _, s23 in batch]
 
-        # Name features (0-9)
-        X[sl, 0] = _lev_ratio_batch(n1, n2)
-        X[sl, 1] = _tok_sort_batch(n1, n2)
-        X[sl, 2] = _tok_set_batch(n1, n2)
-        X[sl, 3] = _jaccard_tokens_batch(n1, n2)
-        X[sl, 4] = _jaccard_bigrams_batch(n1, n2)
-        X[sl, 5] = _prefix_match_batch(n1, n2, 3)
-        X[sl, 6] = _prefix_match_batch(n1, n2, 5)
-        X[sl, 7] = _lcs_ratio_batch(n1, n2)
-        X[sl, 8] = _length_ratio_batch(n1, n2)
-        X[sl, 9] = np.array([1.0 if a == b else 0.0 for a, b in zip(n1, n2)], dtype=np.float32)
+            batch_len = len(batch)
+            tasks = []
 
-        # Address features (10-16)
-        X[sl, 10] = _lev_ratio_batch(a1, a2)
-        X[sl, 11] = _tok_sort_batch(a1, a2)
-        X[sl, 12] = _jaccard_tokens_batch(a1, a2)
-        X[sl, 13] = _jaccard_bigrams_batch(a1, a2)
-        X[sl, 14] = _numeric_overlap_batch(a1, a2)
-        X[sl, 15] = _prefix_match_batch(a1, a2, 5)
-        X[sl, 16] = _lcs_ratio_batch(a1, a2)
+            for sub_start in range(0, batch_len, sub_chunk_size):
+                sub_end = min(sub_start + sub_chunk_size, batch_len)
+                tasks.append((
+                    batch_start + sub_start,
+                    batch_start + sub_end,
+                    executor.submit(
+                        _compute_features_sub_batch,
+                        n1[sub_start:sub_end], n2[sub_start:sub_end],
+                        a1[sub_start:sub_end], a2[sub_start:sub_end],
+                        c1[sub_start:sub_end], c2[sub_start:sub_end],
+                    )
+                ))
 
-        # Meta features (17-19)
-        X[sl, 17] = np.array([1.0 if a == b else 0.0 for a, b in zip(c1, c2)], dtype=np.float32)
-        X[sl, 18] = _cross_tok_batch(n1, a2)
-        X[sl, 19] = _cross_tok_batch(n2, a1)
+            for g_start, g_end, future in tasks:
+                X[g_start:g_end, :] = future.result()
 
-        # Progress reporting
-        done = batch_end
-        if done % 200_000 == 0 or done == n:
-            elapsed = time.time() - t_start
-            rate = done / max(elapsed, 0.001)
-            remaining = (n - done) / max(rate, 0.001) / 60.0
-            pct = 100.0 * done / n
-            logger.info(f"  Features: {done:,}/{n:,} pairs ({pct:.1f}%) — {rate:,.0f} pairs/sec — ETA {remaining:.1f} min")
+            done = batch_end
+            if done % 200_000 == 0 or done == n:
+                elapsed = time.time() - t_start
+                rate = done / max(elapsed, 0.001)
+                remaining = (n - done) / max(rate, 0.001) / 60.0
+                pct = 100.0 * done / n
+                logger.info(f"  Features: {done:,}/{n:,} pairs ({pct:.1f}%) — {rate:,.0f} pairs/sec — ETA {remaining:.1f} min")
 
     del s1_names, s1_addrs, s1_countries, s23_names, s23_addrs, s23_countries, s23_set
     gc.collect()
@@ -260,3 +299,4 @@ def build_feature_matrix(
 if __name__ == "__main__":
     print(f"Features ({len(FEATURE_NAMES)}):", FEATURE_NAMES)
     print(f"rapidfuzz available: {HAS_RAPIDFUZZ}")
+    print(f"Workers: {N_WORKERS}")
