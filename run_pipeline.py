@@ -64,8 +64,8 @@ def main():
         "--neg-ratio", "5",
     ]
     if args.dev:
-        train_cmd += ["--sample-s1", "200000"]
-        print("\n⚡ DEV MODE: sampling 200K S1 entities for fast iteration")
+        train_cmd += ["--sample-s1", "200000", "--sample-s23", "500000"]
+        print("\n⚡ DEV MODE: sampling 200K S1 + 500K S2/S3 for fast iteration")
 
     predict_cmd = [
         sys.executable, os.path.join(SRC, "predict.py"),

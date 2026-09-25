@@ -54,6 +54,8 @@ def parse_args():
         help="Fraction of S1 for validation (default 10% = ~220K entities)")
     parser.add_argument("--sample-s1", type=int, default=0,
         help="If >0, randomly sample this many S1 entities for fast dev runs. 0=use all.")
+    parser.add_argument("--sample-s23", type=int, default=0,
+        help="If >0, sample this many S2+S3 rows for fast dev runs (e.g. 500000). 0=use all.")
     parser.add_argument("--chunk-size", type=int, default=200_000,
         help="S1 chunk size for blocking (tune based on RAM)")
     parser.add_argument("--trigram-min", type=int, default=2,
@@ -99,6 +101,16 @@ def main():
         sample_ids = rng.choice(s1["entity_id"].values, size=args.sample_s1, replace=False)
         s1 = s1[s1["entity_id"].isin(sample_ids)].reset_index(drop=True)
         logger.info(f"  Sampled S1: {len(s1):,}")
+
+    if args.sample_s23 > 0:
+        total_s23 = len(s2) + len(s3)
+        if args.sample_s23 < total_s23:
+            logger.info(f"Sampling {args.sample_s23:,} S2/S3 rows for dev run (from {total_s23:,})...")
+            n2 = int(args.sample_s23 * len(s2) / total_s23)
+            n3 = args.sample_s23 - n2
+            s2 = s2.sample(n=min(n2, len(s2)), random_state=args.seed).reset_index(drop=True)
+            s3 = s3.sample(n=min(n3, len(s3)), random_state=args.seed).reset_index(drop=True)
+            logger.info(f"  Sampled S2: {len(s2):,} | S3: {len(s3):,}")
 
     all_s1_ids = s1["entity_id"].tolist()
 
