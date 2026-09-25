@@ -22,6 +22,8 @@ import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import precision_recall_curve
 
+from gpu_utils import xgboost_device, HAS_XGBOOST_CUDA
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,9 +53,11 @@ try:
             self.model = None
             self.threshold = 0.5
             self.backend = "xgboost"
+            self._device = xgboost_device()
 
         def fit(self, X, y, X_val=None, y_val=None):
             ratio = (y == 0).sum() / max((y == 1).sum(), 1)
+            logger.info(f"XGBoost training on device='{self._device}'")
             self.model = xgb.XGBClassifier(
                 n_estimators=self.n_estimators,
                 max_depth=6,
@@ -61,9 +65,9 @@ try:
                 subsample=0.8,
                 colsample_bytree=0.8,
                 scale_pos_weight=ratio,
-                use_label_encoder=False,
                 eval_metric="logloss",
                 tree_method="hist",
+                device=self._device,
                 n_jobs=-1,
                 random_state=42,
             )
@@ -94,7 +98,7 @@ try:
             obj.threshold = d["threshold"]
             return obj
 
-    logger.info("Using XGBoost backend")
+    logger.info(f"Using XGBoost backend (device={xgboost_device()})")
 
 except ImportError:
     try:

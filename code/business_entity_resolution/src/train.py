@@ -31,6 +31,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from gpu_utils import gpu_summary
 from preprocess import preprocess_df
 from blocking import blocking_pass_chunked, compute_blocking_stats
 from features import build_feature_matrix, FEATURE_NAMES
@@ -85,6 +86,9 @@ def main():
     args = parse_args()
     rng = np.random.default_rng(args.seed)
     t_start = time.time()
+
+    # ── GPU status ────────────────────────────────────────────────────────────
+    logger.info("GPU capabilities:\n" + gpu_summary())
 
     # ── Load data ─────────────────────────────────────────────────────────────
     logger.info("Loading training source files...")

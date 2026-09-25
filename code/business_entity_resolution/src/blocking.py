@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 2: Blocking / Candidate Generation  (scale-aware, precision-tuned)
+Step 2: Blocking / Candidate Generation  (scale-aware, precision-tuned, GPU-accelerated)
 
 Target: ~20-50 candidates per S1 entity on full 10M S2+S3 dataset.
 
@@ -10,11 +10,16 @@ Blocking strategies (all country-conditioned):
   3. Sorted char-bigram key (top-6 bigrams of name) + country
   4. First 2 tokens of name sorted + country
   5. Trigram inverted index with min_shared ≥ 3  (raised from 2 to cut FPs)
+  6. [GPU] TF-IDF char n-gram cosine similarity via PyTorch CUDA (top-K per entity)
 
-Removed:
-  - name-prefix-3  (too broad → explodes bucket sizes)
-  - consonant-only key  (also too broad)
-  - min_shared=2 trigrams  (generates ~500 candidates/entity on full data)
+GPU acceleration:
+  When PyTorch CUDA is available, an additional TF-IDF cosine blocking pass
+  is run on GPU. Sparse TF-IDF matrices are built on CPU (scikit-learn), then
+  batched GPU matrix multiplication finds the top-K most similar S2/S3
+  candidates per S1 entity. This catches candidates that the hash-based
+  strategies miss (different prefixes, reorderings, transliterations).
+
+Falls back to CPU-only trigram blocking when CUDA is unavailable.
 """
 import re
 import logging
@@ -24,12 +29,20 @@ from typing import Dict, Set
 import pandas as pd
 import numpy as np
 
+from gpu_utils import HAS_TORCH_CUDA, get_torch, get_device
+
 logger = logging.getLogger(__name__)
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 TRIGRAM_MIN_SHARED   = 3     # must share at least this many char-3-grams
 TRIGRAM_MAX_PER_KEY  = 50    # cap postings per trigram (skip super-common ones)
 MAX_CANDIDATES_PER_S1 = 200  # hard cap per S1 entity (safety valve)
+
+# GPU TF-IDF blocking knobs
+TFIDF_TOP_K       = 25       # top-K candidates per S1 entity from TF-IDF
+TFIDF_MIN_SCORE   = 0.15     # minimum cosine similarity to keep a candidate
+TFIDF_NGRAM_RANGE = (2, 4)   # character n-gram range for TF-IDF
+TFIDF_BATCH_SIZE  = 4096     # S1 rows per GPU batch (tune for 8GB VRAM)
 
 
 # ── Character n-gram helpers ──────────────────────────────────────────────────
@@ -118,6 +131,103 @@ def trigram_candidates(
     return {eid for eid, cnt in counter.items() if cnt >= TRIGRAM_MIN_SHARED}
 
 
+# ── GPU-accelerated TF-IDF cosine blocking ────────────────────────────────────
+
+def _gpu_tfidf_blocking(
+    s1: pd.DataFrame,
+    s23: pd.DataFrame,
+    top_k: int = TFIDF_TOP_K,
+    min_score: float = TFIDF_MIN_SCORE,
+    batch_size: int = TFIDF_BATCH_SIZE,
+) -> Dict[str, Set[str]]:
+    """
+    GPU-accelerated TF-IDF character n-gram cosine similarity blocking.
+
+    1. Build TF-IDF sparse matrices on CPU (scikit-learn).
+    2. For each country group, convert to dense PyTorch tensors on GPU.
+    3. Batch matrix-multiply S1 × S23^T to get cosine similarities.
+    4. Extract top-K candidates per S1 entity above min_score threshold.
+
+    Returns dict of {s1_entity_id: set of s23_entity_ids}.
+    """
+    torch = get_torch()
+    device = get_device()
+
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    candidates: Dict[str, Set[str]] = {}
+
+    # Group by country to avoid cross-country matches
+    s1_countries = s1["country_clean"].unique()
+    s23_grouped = s23.groupby("country_clean")
+
+    for country in s1_countries:
+        s1_c = s1[s1["country_clean"] == country]
+        if country not in s23_grouped.groups:
+            for eid in s1_c["entity_id"]:
+                candidates[eid] = set()
+            continue
+        s23_c = s23_grouped.get_group(country)
+
+        if len(s1_c) == 0 or len(s23_c) == 0:
+            continue
+
+        # Build combined name+address text for TF-IDF
+        s1_texts  = (s1_c["name_clean"].fillna("") + " " + s1_c["addr_clean"].fillna("")).tolist()
+        s23_texts = (s23_c["name_clean"].fillna("") + " " + s23_c["addr_clean"].fillna("")).tolist()
+        s1_ids  = s1_c["entity_id"].tolist()
+        s23_ids = s23_c["entity_id"].tolist()
+
+        # Fit TF-IDF on S23 (the "database" side)
+        vectorizer = TfidfVectorizer(
+            analyzer="char_wb",
+            ngram_range=TFIDF_NGRAM_RANGE,
+            max_features=50_000,
+            sublinear_tf=True,
+            dtype=np.float32,
+        )
+        tfidf_s23 = vectorizer.fit_transform(s23_texts)   # sparse (n_s23, vocab)
+        tfidf_s1  = vectorizer.transform(s1_texts)         # sparse (n_s1, vocab)
+
+        # Convert to dense PyTorch tensors — work in batches to fit in 8GB VRAM
+        # S23 matrix stays on GPU for all batches
+        s23_dense = torch.tensor(tfidf_s23.toarray(), device=device, dtype=torch.float16)  # (n_s23, V)
+        s23_dense_t = s23_dense.T  # (V, n_s23)
+
+        actual_k = min(top_k, len(s23_ids))
+
+        for batch_start in range(0, len(s1_ids), batch_size):
+            batch_end = min(batch_start + batch_size, len(s1_ids))
+            s1_batch = tfidf_s1[batch_start:batch_end]
+
+            s1_dense = torch.tensor(s1_batch.toarray(), device=device, dtype=torch.float16)  # (B, V)
+
+            # Cosine similarity = S1_batch @ S23^T  (both already L2-normalized by TF-IDF)
+            sim = torch.mm(s1_dense, s23_dense_t)  # (B, n_s23)
+
+            # Top-K per row
+            topk_scores, topk_indices = torch.topk(sim, k=actual_k, dim=1)
+
+            # Move results to CPU and build candidate sets
+            topk_scores_cpu = topk_scores.cpu().float().numpy()
+            topk_indices_cpu = topk_indices.cpu().numpy()
+
+            for i in range(batch_end - batch_start):
+                s1_id = s1_ids[batch_start + i]
+                cand_set = candidates.get(s1_id, set())
+                for j in range(actual_k):
+                    if topk_scores_cpu[i, j] >= min_score:
+                        cand_set.add(s23_ids[topk_indices_cpu[i, j]])
+                candidates[s1_id] = cand_set
+
+            del s1_dense, sim, topk_scores, topk_indices
+
+        del s23_dense, s23_dense_t
+        torch.cuda.empty_cache()
+
+    return candidates
+
+
 # ── Main blocking entry point ─────────────────────────────────────────────────
 
 def blocking_pass(
@@ -137,6 +247,9 @@ def blocking_pass_chunked(
     """
     Memory-safe chunked blocking for large S1 datasets.
     Builds S2/S3 indexes once, processes S1 in chunks.
+
+    When PyTorch CUDA is available, adds GPU TF-IDF cosine candidates
+    to complement the hash-based and trigram strategies.
     """
     logger.info(f"Building blocking keys for {len(s23):,} S2/S3 records...")
     s23_k = build_blocking_keys(s23)
@@ -186,6 +299,34 @@ def blocking_pass_chunked(
         if n_chunks > 1 and ((chunk_i + 1) % 5 == 0 or chunk_i == n_chunks - 1):
             done = min((chunk_i + 1) * chunk_size, len(s1))
             logger.info(f"  Chunked blocking: {done:,}/{len(s1):,} S1 rows processed")
+
+    # ── Phase C: GPU TF-IDF cosine blocking (additive — only adds candidates) ─
+    if HAS_TORCH_CUDA:
+        logger.info("Running GPU-accelerated TF-IDF cosine blocking...")
+        import time
+        t0 = time.time()
+        try:
+            gpu_cands = _gpu_tfidf_blocking(s1, s23)
+            # Merge GPU candidates into existing candidates
+            gpu_added = 0
+            for s1_id, gpu_set in gpu_cands.items():
+                if s1_id in all_candidates:
+                    before = len(all_candidates[s1_id])
+                    all_candidates[s1_id].update(gpu_set)
+                    gpu_added += len(all_candidates[s1_id]) - before
+                else:
+                    all_candidates[s1_id] = gpu_set
+                    gpu_added += len(gpu_set)
+            logger.info(f"  GPU TF-IDF added {gpu_added:,} new candidates in {time.time()-t0:.0f}s")
+        except Exception as e:
+            logger.warning(f"  GPU TF-IDF blocking failed ({e}), continuing with CPU-only candidates")
+    else:
+        logger.info("GPU not available — skipping TF-IDF cosine blocking")
+
+    # Re-apply hard cap after GPU additions
+    for eid in all_candidates:
+        if len(all_candidates[eid]) > MAX_CANDIDATES_PER_S1:
+            all_candidates[eid] = set(sorted(all_candidates[eid])[:MAX_CANDIDATES_PER_S1])
 
     total = sum(len(v) for v in all_candidates.values())
     avg = total / max(len(all_candidates), 1)

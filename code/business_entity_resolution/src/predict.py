@@ -21,6 +21,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+from gpu_utils import gpu_summary
 from preprocess import preprocess_df
 from blocking import blocking_pass_chunked
 from features import build_feature_matrix
@@ -59,6 +60,9 @@ def parse_args():
 def main():
     args = parse_args()
     t_start = time.time()
+
+    # ── GPU status ────────────────────────────────────────────────────────────
+    logger.info("GPU capabilities:\n" + gpu_summary())
 
     # ── Load model ────────────────────────────────────────────────────────────
     logger.info(f"Loading model from {args.model}...")
