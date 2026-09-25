@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Step 2: Blocking / Candidate Generation  (scale-aware, precision-tuned)
+Step 2: Blocking / Candidate Generation (scale-aware, precision-tuned, high-performance)
 
 Target: ~20-50 candidates per S1 entity on full 10M S2+S3 dataset.
 
@@ -9,12 +9,12 @@ Blocking strategies (all country-conditioned):
   2. First numeric token in address + country  (only when num >= 2 digits)
   3. Sorted char-bigram key (top-6 bigrams of name) + country
   4. First 2 tokens of name sorted + country
-  5. Trigram inverted index with min_shared ≥ 3  (raised from 2 to cut FPs)
+  5. Trigram inverted index with min_shared >= 3
 
-Removed:
-  - name-prefix-3  (too broad → explodes bucket sizes)
-  - consonant-only key  (also too broad)
-  - min_shared=2 trigrams  (generates ~500 candidates/entity on full data)
+Performance:
+  - Vectorized string operations and fast zip loops (replaces slow df.iterrows())
+  - Memory-safe chunking for S1
+  - Hard candidate cap per S1 entity to avoid combinatorial explosion
 """
 import re
 import logging
@@ -61,61 +61,67 @@ def _first_digits(text: str) -> str:
 
 def build_blocking_keys(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    cc = df["country_clean"]
-    nc = df["name_clean"]
+    cc = df["country_clean"].fillna("").astype(str)
+    nc = df["name_clean"].fillna("").astype(str)
+    an = df["addr_num"].fillna("").astype(str)
 
-    df["key_name4"]   = cc + "||" + nc.str[:4]
-    df["key_addr_num"] = cc + "||" + df["addr_num"].where(df["addr_num"].str.len() >= 2, "")
-    df["key_bigram6"] = cc + "||" + nc.apply(lambda x: _sorted_bigram_key(x, 6))
-    df["key_tok2"]    = cc + "||" + nc.apply(lambda x: _first_n_tokens_sorted(x, 2))
+    df["key_name4"]    = cc + "||" + nc.str[:4]
+    df["key_addr_num"] = cc + "||" + an.where(an.str.len() >= 2, "")
+    df["key_bigram6"]  = cc + "||" + nc.apply(lambda x: _sorted_bigram_key(x, 6))
+    df["key_tok2"]     = cc + "||" + nc.apply(lambda x: _first_n_tokens_sorted(x, 2))
 
     return df
 
 
 def _index_by_key(df: pd.DataFrame, key_col: str, min_suffix_len: int = 3) -> Dict[str, list]:
     idx = defaultdict(list)
-    for _, row in df.iterrows():
-        k = row[key_col]
-        suffix = k.split("||", 1)[-1] if "||" in k else ""
+    keys = df[key_col].to_numpy()
+    eids = df["entity_id"].to_numpy()
+    for k, eid in zip(keys, eids):
+        k_str = str(k)
+        suffix = k_str.split("||", 1)[-1] if "||" in k_str else ""
         if len(suffix) >= min_suffix_len:
-            idx[k].append(row["entity_id"])
+            idx[k_str].append(eid)
     return idx
 
 
 # ── Trigram inverted index ────────────────────────────────────────────────────
 
 def build_trigram_index(df: pd.DataFrame) -> Dict[tuple, list]:
-    """Build (country, trigram) → [entity_id, ...] index from S2/S3."""
+    """Build (country, trigram) -> [entity_id, ...] index from S2/S3."""
     idx = defaultdict(list)
-    for _, row in df.iterrows():
-        cc = row["country_clean"]
-        nc = row["name_clean"]
+    ccs = df["country_clean"].to_numpy()
+    ncs = df["name_clean"].to_numpy()
+    eids = df["entity_id"].to_numpy()
+
+    for cc, nc, eid in zip(ccs, ncs, eids):
+        cc_str = str(cc)
         seen = set()
-        for tg in _trigrams(nc):
+        for tg in _trigrams(str(nc)):
             if tg not in seen:
                 seen.add(tg)
-                idx[(cc, tg)].append(row["entity_id"])
+                idx[(cc_str, tg)].append(eid)
     return idx
 
 
 def trigram_candidates(
-    s1_row: pd.Series,
+    country: str,
+    name: str,
     trigram_idx: Dict,
+    min_shared: int = TRIGRAM_MIN_SHARED,
 ) -> Set[str]:
-    """Return S2/S3 IDs sharing >= TRIGRAM_MIN_SHARED trigrams with s1_row."""
-    cc = s1_row["country_clean"]
-    nc = s1_row["name_clean"]
+    """Return S2/S3 IDs sharing >= min_shared trigrams with s1 entity."""
     counter = defaultdict(int)
     seen_tg = set()
-    for tg in _trigrams(nc):
+    for tg in _trigrams(name):
         if tg in seen_tg:
             continue
         seen_tg.add(tg)
-        postings = trigram_idx.get((cc, tg), [])
+        postings = trigram_idx.get((country, tg), [])
         if len(postings) <= TRIGRAM_MAX_PER_KEY:   # skip ultra-common trigrams
             for eid in postings:
                 counter[eid] += 1
-    return {eid for eid, cnt in counter.items() if cnt >= TRIGRAM_MIN_SHARED}
+    return {eid for eid, cnt in counter.items() if cnt >= min_shared}
 
 
 # ── Main blocking entry point ─────────────────────────────────────────────────
@@ -132,7 +138,7 @@ def blocking_pass_chunked(
     s1: pd.DataFrame,
     s23: pd.DataFrame,
     chunk_size: int = 200_000,
-    trigram_min_shared: int = TRIGRAM_MIN_SHARED,   # kept for API compat
+    trigram_min_shared: int = TRIGRAM_MIN_SHARED,
 ) -> Dict[str, Set[str]]:
     """
     Memory-safe chunked blocking for large S1 datasets.
@@ -158,28 +164,38 @@ def blocking_pass_chunked(
     for chunk_i in range(n_chunks):
         chunk = s1.iloc[chunk_i * chunk_size: (chunk_i + 1) * chunk_size]
         chunk_k = build_blocking_keys(chunk)
-        chunk_cands: Dict[str, Set[str]] = {eid: set() for eid in chunk["entity_id"]}
 
-        # Phase A: hash blocking
-        for kc in key_cols:
-            for _, row in chunk_k.iterrows():
-                k = row[kc]
+        chunk_eids = chunk_k["entity_id"].to_numpy()
+        chunk_ccs = chunk_k["country_clean"].to_numpy()
+        chunk_ncs = chunk_k["name_clean"].to_numpy()
+        key_arrays = [(kc, chunk_k[kc].to_numpy()) for kc in key_cols]
+
+        chunk_cands: Dict[str, Set[str]] = {eid: set() for eid in chunk_eids}
+
+        # Single fast pass per row in chunk: hash keys + trigrams
+        for i in range(len(chunk_eids)):
+            eid = chunk_eids[i]
+            cc_str = str(chunk_ccs[i])
+            nc_str = str(chunk_ncs[i])
+            cset = chunk_cands[eid]
+
+            # Hash lookups
+            for kc, arr in key_arrays:
+                k = str(arr[i])
                 suffix = k.split("||", 1)[-1] if "||" in k else ""
                 if len(suffix) >= 3:
-                    chunk_cands[row["entity_id"]].update(
-                        s23_hash_idxs[kc].get(k, [])
-                    )
+                    postings = s23_hash_idxs[kc].get(k)
+                    if postings:
+                        cset.update(postings)
 
-        # Phase B: trigram blocking
-        for _, row in chunk_k.iterrows():
-            new_c = trigram_candidates(row, trigram_idx)
-            chunk_cands[row["entity_id"]].update(new_c)
+            # Trigram lookup
+            tg_cands = trigram_candidates(cc_str, nc_str, trigram_idx, min_shared=trigram_min_shared)
+            if tg_cands:
+                cset.update(tg_cands)
 
-        # Hard cap per entity to prevent explosions
-        for eid in chunk_cands:
-            if len(chunk_cands[eid]) > MAX_CANDIDATES_PER_S1:
-                # Keep a deterministic subset (sorted for reproducibility)
-                chunk_cands[eid] = set(sorted(chunk_cands[eid])[:MAX_CANDIDATES_PER_S1])
+            # Hard cap per entity to prevent explosions
+            if len(cset) > MAX_CANDIDATES_PER_S1:
+                chunk_cands[eid] = set(sorted(cset)[:MAX_CANDIDATES_PER_S1])
 
         all_candidates.update(chunk_cands)
 
@@ -199,10 +215,12 @@ def compute_blocking_stats(
 ) -> dict:
     """Compute recall ceiling and avg candidates vs ground truth."""
     gt_map = {}
-    for _, row in gt_df.iterrows():
-        s1 = row["source1_entity_id"]
-        matched = str(row.get("matched_entity_ids", "")).strip()
-        ids = set(x.strip() for x in matched.split(",") if x.strip()) if matched else set()
+    s1_col = gt_df["source1_entity_id"].to_numpy()
+    match_col = gt_df["matched_entity_ids"].to_numpy()
+
+    for s1, matched in zip(s1_col, match_col):
+        matched_str = str(matched).strip() if pd.notna(matched) else ""
+        ids = set(x.strip() for x in matched_str.split(",") if x.strip()) if matched_str else set()
         gt_map[s1] = ids
 
     total_true = total_recalled = 0

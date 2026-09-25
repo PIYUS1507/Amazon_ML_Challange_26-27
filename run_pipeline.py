@@ -60,7 +60,7 @@ def main():
         "--model-out", os.path.join(ROOT, "models", "matching_model.pkl"),
         "--val-fraction", "0.1",
         "--chunk-size", "200000",
-        "--trigram-min", "2",
+        "--trigram-min", "3",
         "--neg-ratio", "5",
     ]
     if args.dev:
@@ -73,7 +73,7 @@ def main():
         "--model", os.path.join(ROOT, "models", "matching_model.pkl"),
         "--output-dir", os.path.join(ROOT, "output"),
         "--chunk-size", "200000",
-        "--trigram-min", "2",
+        "--trigram-min", "3",
     ]
 
     validate_cmd = [

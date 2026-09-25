@@ -120,8 +120,10 @@ def _clean_name_series(s: pd.Series) -> pd.Series:
 def _clean_addr_series(s: pd.Series) -> pd.Series:
     """Fully vectorized address normalization."""
     s = _normalize_series(s).str.lower().str.strip()
-    s = s.str.replace(r"[^\w\s,]", " ", regex=True)
+    # Use character-class replace via numpy to avoid pandas 80MB mask on 10M rows
     arr = s.to_numpy(dtype=object)
+    _non_word = re.compile(r"[^\w\s,]")
+    arr = np.array([_non_word.sub(" ", x) for x in arr], dtype=object)
     for pat, repl in _ADDR_RE:
         arr = np.array([pat.sub(repl, x) for x in arr], dtype=object)
     s = pd.Series(arr, index=s.index, dtype=str)
@@ -153,23 +155,31 @@ def _consonant_key(s: pd.Series) -> pd.Series:
 
 # ── Main public API ───────────────────────────────────────────────────────────
 
-def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
+def preprocess_df(df: pd.DataFrame, chunk_size: int = 500_000) -> pd.DataFrame:
     """
     Apply all normalization steps to a source dataframe.
-    Fully vectorized — handles 10M rows in ~30-60s.
+    Processes in chunks to avoid pandas memory spikes on 10M+ row DataFrames.
+    chunk_size=500K keeps peak memory under ~2GB per chunk.
     """
-    df = df.copy()
+    if len(df) <= chunk_size:
+        return _preprocess_chunk(df)
 
-    # Core normalized fields
+    chunks = []
+    for start in range(0, len(df), chunk_size):
+        chunk = df.iloc[start: start + chunk_size]
+        chunks.append(_preprocess_chunk(chunk))
+    return pd.concat(chunks, ignore_index=True)
+
+
+def _preprocess_chunk(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply normalization to a single chunk."""
+    df = df.copy()
     df["name_clean"]    = _clean_name_series(df["business_name"])
     df["addr_clean"]    = _clean_addr_series(df["business_address"])
     df["country_clean"] = df["country"].str.lower().str.strip().fillna("")
-
-    # Blocking key ingredients
     df["name_prefix"]   = _first_token(df["name_clean"])
     df["addr_num"]      = _first_digit_seq(df["addr_clean"])
     df["consonant_key"] = _consonant_key(df["name_clean"])
-
     return df
 
 

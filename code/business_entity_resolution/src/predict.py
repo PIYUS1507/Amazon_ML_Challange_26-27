@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--chunk-size", type=int, default=200_000,
         help="S1 chunk size for blocking")
-    parser.add_argument("--trigram-min", type=int, default=2)
+    parser.add_argument("--trigram-min", type=int, default=3)
     parser.add_argument("--threshold", type=float, default=None,
         help="Override learned threshold")
     parser.add_argument("--skip-validate", action="store_true")
