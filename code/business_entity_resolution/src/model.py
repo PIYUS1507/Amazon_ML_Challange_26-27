@@ -61,7 +61,6 @@ try:
                 subsample=0.8,
                 colsample_bytree=0.8,
                 scale_pos_weight=ratio,
-                use_label_encoder=False,
                 eval_metric="logloss",
                 tree_method="hist",
                 n_jobs=-1,
