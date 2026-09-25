@@ -128,6 +128,7 @@ def main():
             s1_p, s23_p,
             chunk_size=args.chunk_size,
             trigram_min_shared=args.trigram_min,
+            cache=cache,
         )
         logger.info(f"  Blocking done in {time.time()-t0:.0f}s")
 

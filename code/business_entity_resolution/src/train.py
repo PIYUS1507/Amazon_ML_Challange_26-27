@@ -55,7 +55,7 @@ def parse_args():
         default=r"6ab10eb3b23ba_student_resource/student_resource/dataset/train")
     parser.add_argument("--model-out", default="models/matching_model.pkl")
     parser.add_argument("--val-fraction", type=float, default=0.1,
-        help="Fraction of S1 for validation (default 10% = ~220K entities)")
+        help="Fraction of S1 for validation (default 10%% = ~220K entities)")
     parser.add_argument("--sample-s1", type=int, default=0,
         help="If >0, randomly sample this many S1 entities for fast dev runs. 0=use all.")
     parser.add_argument("--sample-s23", type=int, default=0,
@@ -188,6 +188,7 @@ def main():
             s1_train_p, s23_p,
             chunk_size=args.chunk_size,
             trigram_min_shared=args.trigram_min,
+            cache=cache,
         )
         logger.info(f"  Train blocking: {time.time()-t0:.0f}s")
         cache.save("train_candidates", train_candidates)
@@ -210,6 +211,7 @@ def main():
             s1_val_p, s23_p,
             chunk_size=min(args.chunk_size, 50_000),
             trigram_min_shared=args.trigram_min,
+            cache=cache,
         )
         logger.info(f"  Val blocking: {time.time()-t0:.0f}s")
         cache.save("val_candidates", val_candidates)

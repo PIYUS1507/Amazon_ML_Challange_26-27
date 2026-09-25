@@ -24,7 +24,7 @@ Falls back to CPU-only trigram blocking when CUDA is unavailable.
 import re
 import logging
 from collections import defaultdict
-from typing import Dict, Set
+from typing import Dict, Set, Optional, Tuple, Any
 
 import pandas as pd
 import numpy as np
@@ -243,27 +243,44 @@ def blocking_pass_chunked(
     s23: pd.DataFrame,
     chunk_size: int = 200_000,
     trigram_min_shared: int = TRIGRAM_MIN_SHARED,   # kept for API compat
+    cache: Optional[Any] = None,
+    s23_indexes: Optional[Tuple[Dict, Dict]] = None,
 ) -> Dict[str, Set[str]]:
     """
     Memory-safe chunked blocking for large S1 datasets.
-    Builds S2/S3 indexes once, processes S1 in chunks.
+    Builds S2/S3 indexes once (or loads from cache/parameter), processes S1 in chunks.
 
     When PyTorch CUDA is available, adds GPU TF-IDF cosine candidates
     to complement the hash-based and trigram strategies.
     """
-    logger.info(f"Building blocking keys for {len(s23):,} S2/S3 records...")
-    s23_k = build_blocking_keys(s23)
-
     key_cols = ["key_name4", "key_addr_num", "key_bigram6", "key_tok2"]
-    logger.info("Building hash indexes for S2/S3...")
-    s23_hash_idxs = {}
-    for kc in key_cols:
-        s23_hash_idxs[kc] = _index_by_key(s23_k, kc, min_suffix_len=3)
-        logger.info(f"  [{kc}] index: {len(s23_hash_idxs[kc]):,} unique keys")
 
-    logger.info("Building trigram index for S2/S3...")
-    trigram_idx = build_trigram_index(s23_k)
-    logger.info(f"  Trigram index: {len(trigram_idx):,} (country, trigram) keys")
+    if s23_indexes is not None:
+        logger.info("Using pre-built S2/S3 hash & trigram indexes...")
+        s23_hash_idxs, trigram_idx = s23_indexes
+    elif cache is not None and cache.exists("s23_indexes"):
+        logger.info("⚡ Loading S2/S3 hash & trigram indexes from cache...")
+        s23_hash_idxs, trigram_idx = cache.load("s23_indexes")
+    else:
+        logger.info(f"Building blocking keys for {len(s23):,} S2/S3 records...")
+        s23_k = build_blocking_keys(s23)
+
+        logger.info("Building hash indexes for S2/S3...")
+        s23_hash_idxs = {}
+        for kc in key_cols:
+            s23_hash_idxs[kc] = _index_by_key(s23_k, kc, min_suffix_len=3)
+            logger.info(f"  [{kc}] index: {len(s23_hash_idxs[kc]):,} unique keys")
+
+        logger.info("Building trigram index for S2/S3...")
+        trigram_idx = build_trigram_index(s23_k)
+        logger.info(f"  Trigram index: {len(trigram_idx):,} (country, trigram) keys")
+
+        del s23_k
+        import gc
+        gc.collect()
+
+        if cache is not None:
+            cache.save("s23_indexes", (s23_hash_idxs, trigram_idx))
 
     all_candidates: Dict[str, Set[str]] = {}
     n_chunks = max(1, (len(s1) + chunk_size - 1) // chunk_size)
