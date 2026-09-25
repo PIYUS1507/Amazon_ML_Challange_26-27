@@ -20,6 +20,14 @@ output/
 # Dataset (large — don't commit raw data)
 dataset/
 
+# Student resource zip and extracted folder (1GB+)
+*.zip
+6ab10eb3b23ba_student_resource/
+
+# Large data files
+*.tsv
+*.csv
+
 # IDE
 .vscode/
 .idea/
