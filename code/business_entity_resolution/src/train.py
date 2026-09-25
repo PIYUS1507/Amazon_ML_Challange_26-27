@@ -62,7 +62,7 @@ def parse_args():
         help="If >0, sample this many S2+S3 rows for fast dev runs (e.g. 500000). 0=use all.")
     parser.add_argument("--chunk-size", type=int, default=200_000,
         help="S1 chunk size for blocking (tune based on RAM)")
-    parser.add_argument("--trigram-min", type=int, default=2,
+    parser.add_argument("--trigram-min", type=int, default=3,
         help="Min shared trigrams to form a candidate pair")
     parser.add_argument("--neg-ratio", type=int, default=5,
         help="Hard negatives per positive in training data")
@@ -150,7 +150,10 @@ def main():
                 logger.info(f"  Sampled S2: {len(s2):,} | S3: {len(s3):,}")
 
         all_s1_ids = s1["entity_id"].tolist()
-        n_val = max(1000, int(len(all_s1_ids) * args.val_fraction))
+        n_total = len(all_s1_ids)
+        n_val = int(n_total * args.val_fraction)
+        n_val = max(min(n_val, n_total // 2), min(200, n_total // 2))  # 10-50% but ≥200 if possible
+        n_val = max(1, min(n_val, n_total - 1))                         # always leave ≥1 for train
         val_ids = set(rng.choice(all_s1_ids, size=n_val, replace=False).tolist())
         train_ids = set(all_s1_ids) - val_ids
 

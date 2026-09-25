@@ -21,8 +21,10 @@
 - [Evaluation Metric](#-evaluation-metric)
 - [Our Solution](#-our-solution)
 - [Project Structure](#-project-structure)
-- [Quick Start](#-quick-start)
-- [Output Format](#-output-format)
+- [⚡ GPU Acceleration](#-gpu-acceleration)
+- [🚀 How to Use & Pipeline Execution](#-how-to-use--pipeline-execution)
+- [💾 Fine-Grained Sub-Step Caching](#-fine-grained-sub-step-caching)
+- [📤 Output Format](#-output-format)
 - [Constraints & Fair Play](#-constraints--fair-play)
 
 ---
@@ -273,58 +275,136 @@ Amazon ML Challange/
 
 ---
 
-## 🚀 Quick Start
+## ⚡ GPU Acceleration
 
-### 1. Install Dependencies
+The pipeline automatically detects and leverages CUDA-capable hardware across critical compute bottlenecks with transparent CPU fallback:
 
-```bash
-pip install -r code/business_entity_resolution/requirements.txt
+| Component | GPU Acceleration | Implementation Details |
+|---|---|---|
+| **Candidate Blocking** | `PyTorch CUDA` | TF-IDF char n-gram sparse/dense cosine similarity search on GPU (top-K per entity) |
+| **Feature Extraction** | `PyTorch CUDA` | Batched prefix matching, length ratios, and tensor operations |
+| **Model Training & Inference** | `XGBoost CUDA` | `tree_method="hist"` with `device="cuda"` on GPU with graceful CPU fallback |
+
+To verify GPU detection status at any time:
+```powershell
+python -c "import sys; sys.path.insert(0, 'code/business_entity_resolution/src'); from gpu_utils import gpu_summary; print(gpu_summary())"
 ```
 
-### 2. Place Dataset
+---
 
-```
-dataset/train/train_source1.tsv
-dataset/train/train_source2.tsv
-dataset/train/train_source3.tsv
-dataset/train/train_ground_truth.tsv
-dataset/test/test_source1.tsv
-dataset/test/test_source2.tsv
-dataset/test/test_source3.tsv
-```
+## 🚀 How to Use & Pipeline Execution
 
-### 3. Run Full Pipeline
+The master script `run_pipeline.py` executes the entire pipeline end-to-end with built-in sub-step caching and GPU acceleration.
 
-```bash
+### 1. Standard Run (Subsequent runs automatically use cache)
+
+```powershell
+# Full production run (all data):
 python run_pipeline.py
+
+# Fast dev run (samples 200K S1 + 500K S2/S3 for rapid iteration):
+python run_pipeline.py --dev
+```
+> **Note:** On the first run, each sub-step computes and checkpoints to disk. On any re-run, completed sub-steps display `⚡ [CACHE HIT]` and resume in seconds without redoing expensive preprocessing, indexing, or feature calculations.
+
+---
+
+### 2. Re-run Only Inference (Skip Step 1 Training)
+
+If your model is already trained and you only want to re-run test predictions and generate submission files:
+
+```powershell
+python run_pipeline.py --skip-train
 ```
 
-This runs training (with 20% validation split + F_0.5 threshold tuning), then inference on the test set, then auto-validates the output format.
+---
 
-### 4. Submit
+### 3. Force Specific Sub-Steps to Recompute
 
-Upload `output/matching_results.tsv` to the leaderboard portal.
+If you made changes to a specific module (e.g. tuning features or blocking), only recompute that sub-step while keeping all earlier ones cached:
 
-### Manual Steps (Optional)
+```powershell
+# Only recompute blocking and features (keeps preprocessing cached):
+python run_pipeline.py --force-step blocking features
 
-```bash
-# Train only
+# Only retrain the model (keeps preprocessing, blocking, and features cached):
+python run_pipeline.py --force-step model
+```
+
+Available sub-steps for `--force-step`:
+`preprocess` | `blocking` | `features` | `training_data` | `model` | `evaluate` | `inference` | `output`
+
+---
+
+### 4. Complete Fresh Run (Ignore all cache)
+
+To bypass the cache completely and recompute everything from scratch:
+
+```powershell
+python run_pipeline.py --no-cache
+```
+
+---
+
+### 5. Custom Cache Directory (Optional)
+
+By default, checkpoints are saved in `cache/` (gitignored). You can specify a custom location:
+
+```powershell
+python run_pipeline.py --cache-dir my_custom_cache
+```
+
+---
+
+## 💾 Fine-Grained Sub-Step Caching
+
+A dedicated disk cache engine ([`cache_utils.py`](code/business_entity_resolution/src/cache_utils.py)) manages intermediate states across training and inference to minimize runtimes and prevent memory exhaustion:
+
+### Training Pipeline Sub-Steps
+| Sub-Step | Checkpoint File | Benefit on Re-Run |
+|---|---|---|
+| **Ground Truth** | `ground_truth_map.pkl` | Skips re-parsing 2.2M ground truth records |
+| **Preprocessing** | `s1_train_p.parquet`, `s23_p.parquet` | **Skips loading 12.5M raw TSV rows** (saves ~5GB RAM & 3 mins) |
+| **S2/S3 Indexes** | `s23_indexes.pkl` | Shared between Train & Val blocking without re-indexing 10M rows twice |
+| **Blocking Candidates** | `train_candidates.pkl`, `val_candidates.pkl` | **Instant reload** (0.5s instead of minutes) |
+| **Feature Engineering** | `train_features.pkl`, `val_features.pkl` | Preserves computed 20 similarity features |
+| **Training Labels** | `train_data_sampled.pkl` | Preserves sampled positive and hard negative pairs |
+| **Model Artifact** | `models/matching_model.pkl` | Reusable trained model checkpoint |
+| **Validation Score** | `val_f05.pkl` | Cached $F_{0.5}$ metric report |
+
+### Inference Pipeline Sub-Steps
+| Sub-Step | Checkpoint File | Benefit on Re-Run |
+|---|---|---|
+| **Test Preprocessing** | `test_s1_p.parquet`, `test_s23_p.parquet` | Skips reloading and cleaning 12M test rows |
+| **Test Blocking** | `test_candidates.pkl` | Skips chunked candidate search over 1.7M entities |
+| **Test Features** | `test_features.pkl` | Instant reuse of test feature matrix |
+| **Inference Predictions** | `test_matches_th_<threshold>.pkl` | Caches predictions per threshold |
+
+---
+
+### Manual Step Execution (Advanced)
+
+You can also run individual scripts directly with fine-grained cache control:
+
+```powershell
+# Train only with caching:
 python code/business_entity_resolution/src/train.py \
-    --train-dir dataset/train \
+    --train-dir 6ab10eb3b23ba_student_resource/student_resource/dataset/train \
     --model-out models/matching_model.pkl \
-    --val-fraction 0.2
+    --cache-dir cache
 
-# Predict only
+# Predict only with caching:
 python code/business_entity_resolution/src/predict.py \
-    --test-dir dataset/test \
+    --test-dir 6ab10eb3b23ba_student_resource/student_resource/dataset/test \
     --model models/matching_model.pkl \
-    --output-dir output
+    --output-dir output \
+    --cache-dir cache
 
-# Validate format
+# Validate format:
 python utils/validate_submission.py \
     --matching output/matching_results.tsv \
     --candidate output/candidate_pairs.tsv \
-    --test-dir dataset/test
+    --test-dir 6ab10eb3b23ba_student_resource/student_resource/dataset/test
 ```
 
 ---

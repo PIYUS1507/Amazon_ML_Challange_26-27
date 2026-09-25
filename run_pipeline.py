@@ -83,7 +83,7 @@ def main():
         "--model-out", model_path,
         "--val-fraction", "0.1",
         "--chunk-size", "200000",
-        "--trigram-min", "2",
+        "--trigram-min", "3",
         "--neg-ratio", "5",
     ] + cache_args
 
@@ -97,7 +97,7 @@ def main():
         "--model", model_path,
         "--output-dir", os.path.join(ROOT, "output"),
         "--chunk-size", "200000",
-        "--trigram-min", "2",
+        "--trigram-min", "3",
     ] + cache_args
 
     validate_cmd = [
